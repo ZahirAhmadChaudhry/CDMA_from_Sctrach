@@ -1,0 +1,26 @@
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+.venvCDMA/
+
+# Local datasets and large resources (do not push)
+data/
+Androids-Corpus/
+opensmile/
+
+# Local experiment outputs
+results/
+
+# Local documents and machine files
+2023TaoPhD.pdf
+*.log
+.DS_Store
+Thumbs.db
