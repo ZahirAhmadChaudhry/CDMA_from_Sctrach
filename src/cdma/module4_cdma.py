@@ -25,6 +25,9 @@ EPOCHS = 300
 LEARNING_RATE = 1e-3
 BATCH_SIZE = 16
 THRESHOLD = 0.5
+LOG_EVERY_EPOCHS = 50
+CHECKPOINT_EVERY_EPOCHS = 50
+PREVIEW_PARTICIPANTS = 5
 
 
 @dataclass(frozen=True)
@@ -139,6 +142,118 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _fold_predictions_path(results_dir: Path, mode: str, rep: int, fold_name: str) -> Path:
+    return results_dir / f"{mode}_rep{rep}_{fold_name}_predictions.csv"
+
+
+def _fold_report_path(results_dir: Path, mode: str, rep: int, fold_name: str) -> Path:
+    return results_dir / f"{mode}_rep{rep}_{fold_name}_report.txt"
+
+
+def _all_folds_predictions_path(results_dir: Path, mode: str, rep: int) -> Path:
+    return results_dir / f"{mode}_rep{rep}_all_folds_predictions.csv"
+
+
+def _all_folds_report_path(results_dir: Path, mode: str, rep: int) -> Path:
+    return results_dir / f"{mode}_rep{rep}_all_folds_report.txt"
+
+
+def _checkpoint_path(results_dir: Path, mode: str, rep: int, fold_name: str) -> Path:
+    checkpoint_dir = results_dir / "checkpoints" / mode / f"rep_{rep}"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    return checkpoint_dir / f"{fold_name}_latest.pt"
+
+
+def save_training_checkpoint(
+    checkpoint_path: Path,
+    mode: str,
+    rep: int,
+    fold_name: str,
+    epoch_index: int,
+    model: CDMAModel,
+    optimizer: torch.optim.Optimizer,
+    training_losses: list[float],
+) -> None:
+    checkpoint_payload = {
+        "mode": mode,
+        "rep": rep,
+        "fold_name": fold_name,
+        "epoch_index": epoch_index,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "training_losses": training_losses,
+        "saved_at": time.time(),
+    }
+
+    temporary_checkpoint = checkpoint_path.with_suffix(".tmp")
+    torch.save(checkpoint_payload, temporary_checkpoint)
+    temporary_checkpoint.replace(checkpoint_path)
+
+
+def load_training_checkpoint(checkpoint_path: Path, device: torch.device) -> dict[str, object] | None:
+    if not checkpoint_path.exists():
+        return None
+    return torch.load(checkpoint_path, map_location=device)
+
+
+def append_history_row(history_path: Path, field_names: list[str], row_data: dict[str, object]) -> None:
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    file_exists = history_path.exists()
+
+    with history_path.open(mode="a", encoding="utf-8", newline="") as history_file:
+        writer = csv.DictWriter(history_file, fieldnames=field_names)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row_data)
+
+
+def load_predictions_csv(predictions_path: Path) -> list[dict[str, object]]:
+    predictions: list[dict[str, object]] = []
+    if not predictions_path.exists():
+        return predictions
+
+    with predictions_path.open(mode="r", encoding="utf-8", newline="") as prediction_file:
+        reader = csv.DictReader(prediction_file)
+        for row in reader:
+            output_probabilities: dict[str, float] = {}
+            for output_name in ("p_c", "p_o", "p_t", "p_d", "p_f1", "p_f2"):
+                cell_value = row.get(output_name, "")
+                if cell_value:
+                    output_probabilities[output_name] = float(cell_value)
+
+            predictions.append(
+                {
+                    "participant_id": row["participant_id"],
+                    "true_label": int(row["true_label"]),
+                    "predicted_label": int(row["predicted_label"]),
+                    "p_hat": float(row["p_hat"]),
+                    "output_probabilities": output_probabilities,
+                    "fold_name": row.get("fold", ""),
+                }
+            )
+
+    return predictions
+
+
+def log_prediction_preview(predictions: list[dict[str, object]], top_k: int, mode: str, fold_name: str) -> None:
+    if not predictions:
+        LOGGER.info("mode=%s fold=%s has no predictions to preview.", mode, fold_name)
+        return
+
+    preview_count = min(top_k, len(predictions))
+    LOGGER.info("mode=%s fold=%s previewing first %d participants:", mode, fold_name, preview_count)
+    for preview_index in range(preview_count):
+        prediction = predictions[preview_index]
+        LOGGER.info(
+            "preview=%d pid=%s true=%d pred=%d p_hat=%.4f",
+            preview_index + 1,
+            prediction["participant_id"],
+            int(prediction["true_label"]),
+            int(prediction["predicted_label"]),
+            float(prediction["p_hat"]),
+        )
 
 
 def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -550,12 +665,17 @@ def compute_binary_metrics(predictions: list[dict[str, object]]) -> dict[str, fl
 
 def run_single_fold(
     project_root: Path,
+    results_dir: Path,
     mode: str,
     test_fold_name: str,
     rep: int,
     epochs: int,
     batch_size: int,
     num_workers: int,
+    log_every_epochs: int,
+    checkpoint_every_epochs: int,
+    preview_participants: int,
+    resume: bool,
 ) -> Module4FoldResult:
     if mode not in MODE_CONFIGS:
         raise ValueError(f"Unsupported mode: {mode}")
@@ -575,11 +695,30 @@ def run_single_fold(
     model = CDMAModel().to(device)
     optimizer = torch.optim.RMSprop(model.parameters(), lr=LEARNING_RATE)
     loss_fn = CombinedBCELoss()
+    checkpoint_path = _checkpoint_path(results_dir, mode, rep, test_fold_name)
 
     training_losses: list[float] = []
+    start_epoch_index = 0
+
+    if resume:
+        checkpoint_state = load_training_checkpoint(checkpoint_path=checkpoint_path, device=device)
+        if checkpoint_state is not None:
+            model.load_state_dict(checkpoint_state["model_state_dict"])
+            optimizer.load_state_dict(checkpoint_state["optimizer_state_dict"])
+            training_losses = [float(loss_value) for loss_value in checkpoint_state.get("training_losses", [])]
+            start_epoch_index = int(checkpoint_state.get("epoch_index", -1)) + 1
+            LOGGER.info(
+                "Resuming mode=%s rep=%d fold=%s from epoch=%d using checkpoint=%s",
+                mode,
+                rep,
+                test_fold_name,
+                start_epoch_index,
+                checkpoint_path,
+            )
+
     start_time = time.time()
 
-    for epoch_index in range(epochs):
+    for epoch_index in range(start_epoch_index, epochs):
         mean_loss = train_one_epoch(
             model=model,
             data_loaders=data_loaders,
@@ -589,15 +728,39 @@ def run_single_fold(
             device=device,
         )
         training_losses.append(mean_loss)
-        LOGGER.info(
-            "mode=%s rep=%d fold=%s epoch=%d/%d loss=%.6f",
-            mode,
-            rep,
-            test_fold_name,
-            epoch_index + 1,
-            epochs,
-            mean_loss,
+
+        current_epoch = epoch_index + 1
+        should_log = (
+            current_epoch == 1
+            or current_epoch == epochs
+            or current_epoch % max(1, log_every_epochs) == 0
         )
+        if should_log:
+            LOGGER.info(
+                "mode=%s rep=%d fold=%s epoch=%d/%d loss=%.6f",
+                mode,
+                rep,
+                test_fold_name,
+                current_epoch,
+                epochs,
+                mean_loss,
+            )
+
+        should_checkpoint = (
+            current_epoch == epochs
+            or current_epoch % max(1, checkpoint_every_epochs) == 0
+        )
+        if should_checkpoint:
+            save_training_checkpoint(
+                checkpoint_path=checkpoint_path,
+                mode=mode,
+                rep=rep,
+                fold_name=test_fold_name,
+                epoch_index=epoch_index,
+                model=model,
+                optimizer=optimizer,
+                training_losses=training_losses,
+            )
 
     predictions = evaluate_model(
         model=model,
@@ -606,6 +769,13 @@ def run_single_fold(
         device=device,
         threshold=THRESHOLD,
     )
+    log_prediction_preview(
+        predictions=predictions,
+        top_k=preview_participants,
+        mode=mode,
+        fold_name=test_fold_name,
+    )
+
     metrics = compute_binary_metrics(predictions)
 
     filtered_fold_sizes = {
@@ -635,26 +805,118 @@ def run_single_fold(
 
 def run_all_folds(
     project_root: Path,
+    results_dir: Path,
     mode: str,
     rep: int,
     epochs: int,
     batch_size: int,
     num_workers: int,
+    log_every_epochs: int,
+    checkpoint_every_epochs: int,
+    preview_participants: int,
+    resume: bool,
+    sanity_result: Module4SanityResult,
 ) -> Module4ConditionResult:
     fold_names = ["fold1", "fold2", "fold3", "fold4", "fold5"]
     fold_results: list[Module4FoldResult] = []
     pooled_predictions: list[dict[str, object]] = []
 
+    fold_history_path = results_dir / "fold_history.csv"
+    pooled_history_path = results_dir / "pooled_history.csv"
+
     for fold_name in fold_names:
-        fold_result = run_single_fold(
-            project_root=project_root,
-            mode=mode,
-            test_fold_name=fold_name,
-            rep=rep,
-            epochs=epochs,
-            batch_size=batch_size,
-            num_workers=num_workers,
-        )
+        fold_predictions_path = _fold_predictions_path(results_dir, mode, rep, fold_name)
+        fold_report_path = _fold_report_path(results_dir, mode, rep, fold_name)
+
+        if resume and fold_predictions_path.exists() and fold_report_path.exists():
+            cached_predictions = load_predictions_csv(fold_predictions_path)
+            cached_metrics = compute_binary_metrics(cached_predictions)
+
+            fold_result = Module4FoldResult(
+                mode=mode,
+                rep=rep,
+                seed=rep * 42,
+                fold_name=fold_name,
+                device="cached",
+                train_participant_count=-1,
+                test_participant_count=len(cached_predictions),
+                train_batch_count=-1,
+                test_batch_count=-1,
+                metrics=cached_metrics,
+                training_losses=[],
+                predictions=cached_predictions,
+                elapsed_seconds=0.0,
+                filtered_fold_sizes={},
+            )
+
+            LOGGER.info(
+                "Skipping completed fold mode=%s rep=%d fold=%s using cached outputs.",
+                mode,
+                rep,
+                fold_name,
+            )
+        else:
+            fold_result = run_single_fold(
+                project_root=project_root,
+                results_dir=results_dir,
+                mode=mode,
+                test_fold_name=fold_name,
+                rep=rep,
+                epochs=epochs,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                log_every_epochs=log_every_epochs,
+                checkpoint_every_epochs=checkpoint_every_epochs,
+                preview_participants=preview_participants,
+                resume=resume,
+            )
+
+            fold_predictions_for_save: list[dict[str, object]] = []
+            for prediction in fold_result.predictions:
+                prediction_copy = dict(prediction)
+                prediction_copy["fold_name"] = fold_name
+                fold_predictions_for_save.append(prediction_copy)
+
+            save_predictions_csv(
+                output_path=fold_predictions_path,
+                mode=mode,
+                rep=rep,
+                predictions=fold_predictions_for_save,
+            )
+
+            fold_report_text = format_fold_report(sanity_result=sanity_result, fold_result=fold_result)
+            save_report(fold_report_text, fold_report_path)
+
+            append_history_row(
+                history_path=fold_history_path,
+                field_names=[
+                    "mode",
+                    "rep",
+                    "fold",
+                    "accuracy",
+                    "precision",
+                    "recall",
+                    "f1",
+                    "train_participants",
+                    "test_participants",
+                    "epochs",
+                    "timestamp",
+                ],
+                row_data={
+                    "mode": mode,
+                    "rep": rep,
+                    "fold": fold_name,
+                    "accuracy": f"{fold_result.metrics['accuracy']:.6f}",
+                    "precision": f"{fold_result.metrics['precision']:.6f}",
+                    "recall": f"{fold_result.metrics['recall']:.6f}",
+                    "f1": f"{fold_result.metrics['f1']:.6f}",
+                    "train_participants": fold_result.train_participant_count,
+                    "test_participants": fold_result.test_participant_count,
+                    "epochs": epochs,
+                    "timestamp": int(time.time()),
+                },
+            )
+
         fold_results.append(fold_result)
 
         for prediction in fold_result.predictions:
@@ -671,6 +933,21 @@ def run_all_folds(
         seen_participants.add(participant_id)
 
     pooled_metrics = compute_binary_metrics(pooled_predictions)
+
+    append_history_row(
+        history_path=pooled_history_path,
+        field_names=["mode", "rep", "accuracy", "precision", "recall", "f1", "prediction_count", "timestamp"],
+        row_data={
+            "mode": mode,
+            "rep": rep,
+            "accuracy": f"{pooled_metrics['accuracy']:.6f}",
+            "precision": f"{pooled_metrics['precision']:.6f}",
+            "recall": f"{pooled_metrics['recall']:.6f}",
+            "f1": f"{pooled_metrics['f1']:.6f}",
+            "prediction_count": len(pooled_predictions),
+            "timestamp": int(time.time()),
+        },
+    )
 
     return Module4ConditionResult(
         mode=mode,
@@ -996,6 +1273,29 @@ def parse_arguments() -> argparse.Namespace:
         action="store_true",
         help="Skip module sanity checks before training.",
     )
+    parser.add_argument(
+        "--log-every-epochs",
+        type=int,
+        default=LOG_EVERY_EPOCHS,
+        help="Print epoch loss every N epochs (plus first and last).",
+    )
+    parser.add_argument(
+        "--checkpoint-every-epochs",
+        type=int,
+        default=CHECKPOINT_EVERY_EPOCHS,
+        help="Save training checkpoint every N epochs (plus final epoch).",
+    )
+    parser.add_argument(
+        "--preview-participants",
+        type=int,
+        default=PREVIEW_PARTICIPANTS,
+        help="Number of test participants to preview in terminal after each fold.",
+    )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Disable checkpoint-based resume and completed-fold reuse.",
+    )
     return parser.parse_args()
 
 
@@ -1009,6 +1309,7 @@ def main() -> int:
     )
 
     run_epochs = 3 if cli_args.quick_test else cli_args.epochs
+    resume_enabled = not cli_args.no_resume
     sanity_result = run_sanity_checks() if not cli_args.skip_sanity_check else Module4SanityResult(
         all_modes_forward_ok=True,
         output_key_mismatch_modes=[],
@@ -1023,11 +1324,17 @@ def main() -> int:
     if cli_args.all_folds:
         condition_result = run_all_folds(
             project_root=project_root,
+            results_dir=results_dir,
             mode=cli_args.mode,
             rep=cli_args.rep,
             epochs=run_epochs,
             batch_size=cli_args.batch_size,
             num_workers=cli_args.num_workers,
+            log_every_epochs=cli_args.log_every_epochs,
+            checkpoint_every_epochs=cli_args.checkpoint_every_epochs,
+            preview_participants=cli_args.preview_participants,
+            resume=resume_enabled,
+            sanity_result=sanity_result,
         )
 
         pooled_predictions: list[dict[str, object]] = []
@@ -1037,8 +1344,8 @@ def main() -> int:
                 prediction_copy["fold_name"] = fold_result.fold_name
                 pooled_predictions.append(prediction_copy)
 
-        predictions_path = results_dir / f"{cli_args.mode}_rep{cli_args.rep}_all_folds_predictions.csv"
-        report_path = results_dir / f"{cli_args.mode}_rep{cli_args.rep}_all_folds_report.txt"
+        predictions_path = _all_folds_predictions_path(results_dir, cli_args.mode, cli_args.rep)
+        report_path = _all_folds_report_path(results_dir, cli_args.mode, cli_args.rep)
 
         save_predictions_csv(
             output_path=predictions_path,
@@ -1059,12 +1366,17 @@ def main() -> int:
 
     fold_result = run_single_fold(
         project_root=project_root,
+        results_dir=results_dir,
         mode=cli_args.mode,
         test_fold_name=cli_args.test_fold,
         rep=cli_args.rep,
         epochs=run_epochs,
         batch_size=cli_args.batch_size,
         num_workers=cli_args.num_workers,
+        log_every_epochs=cli_args.log_every_epochs,
+        checkpoint_every_epochs=cli_args.checkpoint_every_epochs,
+        preview_participants=cli_args.preview_participants,
+        resume=resume_enabled,
     )
 
     fold_predictions: list[dict[str, object]] = []
@@ -1073,8 +1385,8 @@ def main() -> int:
         prediction_copy["fold_name"] = fold_result.fold_name
         fold_predictions.append(prediction_copy)
 
-    predictions_path = results_dir / f"{cli_args.mode}_rep{cli_args.rep}_{cli_args.test_fold}_predictions.csv"
-    report_path = results_dir / f"{cli_args.mode}_rep{cli_args.rep}_{cli_args.test_fold}_report.txt"
+    predictions_path = _fold_predictions_path(results_dir, cli_args.mode, cli_args.rep, cli_args.test_fold)
+    report_path = _fold_report_path(results_dir, cli_args.mode, cli_args.rep, cli_args.test_fold)
 
     save_predictions_csv(
         output_path=predictions_path,
