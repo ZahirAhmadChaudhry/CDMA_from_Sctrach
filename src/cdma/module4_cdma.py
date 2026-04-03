@@ -160,10 +160,15 @@ def _all_folds_report_path(results_dir: Path, mode: str, rep: int) -> Path:
     return results_dir / f"{mode}_rep{rep}_all_folds_report.txt"
 
 
+def _checkpoint_file_path(results_dir: Path, mode: str, rep: int, fold_name: str) -> Path:
+    return results_dir / "checkpoints" / mode / f"rep_{rep}" / f"{fold_name}_latest.pt"
+
+
 def _checkpoint_path(results_dir: Path, mode: str, rep: int, fold_name: str) -> Path:
-    checkpoint_dir = results_dir / "checkpoints" / mode / f"rep_{rep}"
+    checkpoint_file = _checkpoint_file_path(results_dir, mode, rep, fold_name)
+    checkpoint_dir = checkpoint_file.parent
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    return checkpoint_dir / f"{fold_name}_latest.pt"
+    return checkpoint_file
 
 
 def save_training_checkpoint(
@@ -254,6 +259,200 @@ def log_prediction_preview(predictions: list[dict[str, object]], top_k: int, mod
             int(prediction["predicted_label"]),
             float(prediction["p_hat"]),
         )
+
+
+def _format_tensor_stats(values: torch.Tensor) -> str:
+    flattened = values.detach().reshape(-1)
+    total_count = int(flattened.numel())
+    nan_count = int(torch.isnan(flattened).sum().item())
+    finite_values = flattened[torch.isfinite(flattened)]
+
+    if int(finite_values.numel()) == 0:
+        return f"count={total_count}, finite=0, nan={nan_count}"
+
+    return (
+        f"count={total_count}, finite={int(finite_values.numel())}, nan={nan_count}, "
+        f"mean={float(finite_values.mean().item()):.6f}, "
+        f"std={float(finite_values.std(unbiased=False).item()):.6f}, "
+        f"min={float(finite_values.min().item()):.6f}, "
+        f"max={float(finite_values.max().item()):.6f}"
+    )
+
+
+def _format_masked_tensor_stats(values: torch.Tensor, mask: torch.Tensor) -> str:
+    valid_values = values[mask > 0]
+    return _format_tensor_stats(valid_values)
+
+
+def _format_attention_std_summary(attention_weights: torch.Tensor, mask: torch.Tensor) -> str:
+    std_values: list[float] = []
+
+    for batch_index in range(attention_weights.size(0)):
+        valid_length = int(mask[batch_index].sum().item())
+        if valid_length <= 0:
+            continue
+
+        valid_attention = attention_weights[batch_index, :valid_length]
+        if valid_length == 1:
+            std_values.append(0.0)
+        else:
+            std_values.append(float(valid_attention.std(unbiased=False).item()))
+
+    if not std_values:
+        return "no valid sequences"
+
+    std_array = np.asarray(std_values, dtype=np.float64)
+    return (
+        f"mean_std={float(std_array.mean()):.6f}, "
+        f"min_std={float(std_array.min()):.6f}, "
+        f"max_std={float(std_array.max()):.6f}"
+    )
+
+
+def run_ctga_batch_diagnostic(
+    project_root: Path,
+    results_dir: Path,
+    mode: str,
+    fold_name: str,
+    rep: int,
+    batch_size: int,
+    num_workers: int,
+    batch_source: str,
+) -> str:
+    if mode not in MODE_CONFIGS:
+        raise ValueError(f"Unsupported mode: {mode}")
+
+    mode_config = MODE_CONFIGS[mode]
+    if mode_config.ga_type != "cross" or not mode_config.need_rt or not mode_config.need_it:
+        message = (
+            f"CT-GA diagnostic skipped for mode={mode}: "
+            "mode does not use cross-stream attention with both streams."
+        )
+        LOGGER.warning(message)
+        return message
+
+    seed = rep * 42
+    set_seed(seed)
+
+    data_loaders = get_dataloaders(
+        project_root=project_root,
+        test_fold_name=fold_name,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        shuffle_train=False,
+    )
+
+    selected_loader = data_loaders.train_loader if batch_source == "train" else data_loaders.test_loader
+    try:
+        batch = next(iter(selected_loader))
+    except StopIteration:
+        message = f"CT-GA diagnostic failed: empty {batch_source} loader for fold={fold_name}."
+        LOGGER.error(message)
+        return message
+
+    device = resolve_device()
+    model = CDMAModel().to(device)
+    model.eval()
+
+    rt_frames, it_frames, rt_mask, it_mask, _ = _prepare_batch_inputs(batch, mode, device)
+    if rt_frames is None or it_frames is None or rt_mask is None or it_mask is None:
+        raise ValueError("CT-GA diagnostic requires both RT and IT inputs.")
+
+    with torch.no_grad():
+        rt_sequence, _, _ = model._encode_stream(rt_frames, rt_mask, use_mla=mode_config.use_mla)
+        it_sequence, _, _ = model._encode_stream(it_frames, it_mask, use_mla=mode_config.use_mla)
+
+        rt_mean = masked_mean(rt_sequence, rt_mask)
+        it_mean = masked_mean(it_sequence, it_mask)
+
+        rt_cosine_scores = torch_functional.cosine_similarity(
+            rt_sequence,
+            it_mean.unsqueeze(1).expand_as(rt_sequence),
+            dim=-1,
+        )
+        it_cosine_scores = torch_functional.cosine_similarity(
+            it_sequence,
+            rt_mean.unsqueeze(1).expand_as(it_sequence),
+            dim=-1,
+        )
+
+        rt_attention_weights = masked_softmax(rt_cosine_scores, rt_mask)
+        it_attention_weights = masked_softmax(it_cosine_scores, it_mask)
+
+    rt_valid_length = int(rt_mask[0].sum().item())
+    it_valid_length = int(it_mask[0].sum().item())
+    preview_count_rt = min(8, rt_valid_length)
+    preview_count_it = min(8, it_valid_length)
+
+    rt_cos_preview = [
+        float(value)
+        for value in rt_cosine_scores[0, :preview_count_rt].detach().cpu().tolist()
+    ]
+    rt_attn_preview = [
+        float(value)
+        for value in rt_attention_weights[0, :preview_count_rt].detach().cpu().tolist()
+    ]
+    it_cos_preview = [
+        float(value)
+        for value in it_cosine_scores[0, :preview_count_it].detach().cpu().tolist()
+    ]
+    it_attn_preview = [
+        float(value)
+        for value in it_attention_weights[0, :preview_count_it].detach().cpu().tolist()
+    ]
+
+    rt_mean_norms = torch.linalg.norm(rt_mean, dim=1)
+    it_mean_norms = torch.linalg.norm(it_mean, dim=1)
+
+    lines = [
+        "=== Module 4 CT-GA One-Batch Diagnostic ===",
+        "",
+        "[Run Context]",
+        f"- mode: {mode}",
+        f"- rep: {rep}",
+        f"- seed: {seed}",
+        f"- fold: {fold_name}",
+        f"- source batch: {batch_source}",
+        f"- device: {device}",
+        f"- participant ids in batch: {list(batch['pids'])}",
+        "",
+        "[Shapes]",
+        f"- rt_sequence shape: {tuple(rt_sequence.shape)}",
+        f"- it_sequence shape: {tuple(it_sequence.shape)}",
+        f"- rt_mean shape (r): {tuple(rt_mean.shape)}",
+        f"- it_mean shape (s): {tuple(it_mean.shape)}",
+        f"- rt_cosine_scores shape: {tuple(rt_cosine_scores.shape)}",
+        f"- it_cosine_scores shape: {tuple(it_cosine_scores.shape)}",
+        "",
+        "[Reference Vector Stats]",
+        f"- r (rt_mean) stats: {_format_tensor_stats(rt_mean)}",
+        f"- s (it_mean) stats: {_format_tensor_stats(it_mean)}",
+        f"- ||r|| stats: {_format_tensor_stats(rt_mean_norms)}",
+        f"- ||s|| stats: {_format_tensor_stats(it_mean_norms)}",
+        "",
+        "[Cosine + Softmax Stats]",
+        f"- RT cosine stats (masked): {_format_masked_tensor_stats(rt_cosine_scores, rt_mask)}",
+        f"- RT attention stats (masked): {_format_masked_tensor_stats(rt_attention_weights, rt_mask)}",
+        f"- RT attention variability: {_format_attention_std_summary(rt_attention_weights, rt_mask)}",
+        f"- IT cosine stats (masked): {_format_masked_tensor_stats(it_cosine_scores, it_mask)}",
+        f"- IT attention stats (masked): {_format_masked_tensor_stats(it_attention_weights, it_mask)}",
+        f"- IT attention variability: {_format_attention_std_summary(it_attention_weights, it_mask)}",
+        "",
+        "[First Participant Preview]",
+        f"- pid: {batch['pids'][0]}",
+        f"- RT valid length: {rt_valid_length}",
+        f"- RT cosine (first {preview_count_rt}): {[round(value, 6) for value in rt_cos_preview]}",
+        f"- RT attention (first {preview_count_rt}): {[round(value, 6) for value in rt_attn_preview]}",
+        f"- IT valid length: {it_valid_length}",
+        f"- IT cosine (first {preview_count_it}): {[round(value, 6) for value in it_cos_preview]}",
+        f"- IT attention (first {preview_count_it}): {[round(value, 6) for value in it_attn_preview]}",
+    ]
+
+    diagnostic_text = "\n".join(lines)
+    diagnostic_path = results_dir / f"{mode}_rep{rep}_{fold_name}_ctga_diagnostic.txt"
+    save_report(diagnostic_text, diagnostic_path)
+    LOGGER.info("CT-GA diagnostic saved to %s", diagnostic_path)
+    return diagnostic_text
 
 
 def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -815,20 +1014,76 @@ def run_all_folds(
     checkpoint_every_epochs: int,
     preview_participants: int,
     resume: bool,
+    output_mode: str,
     sanity_result: Module4SanityResult,
 ) -> Module4ConditionResult:
+    if output_mode not in {"detailed", "overwrite"}:
+        raise ValueError(f"Unsupported output_mode: {output_mode}")
+
     fold_names = ["fold1", "fold2", "fold3", "fold4", "fold5"]
     fold_results: list[Module4FoldResult] = []
     pooled_predictions: list[dict[str, object]] = []
+    completed_folds: set[str] = set()
 
     fold_history_path = results_dir / "fold_history.csv"
     pooled_history_path = results_dir / "pooled_history.csv"
+    all_folds_predictions_path = _all_folds_predictions_path(results_dir, mode, rep)
+    all_folds_report_path = _all_folds_report_path(results_dir, mode, rep)
+
+    if resume and output_mode == "overwrite" and all_folds_predictions_path.exists() and all_folds_report_path.exists():
+        cached_pooled_predictions = load_predictions_csv(all_folds_predictions_path)
+        cached_predictions_by_fold: dict[str, list[dict[str, object]]] = {fold_name: [] for fold_name in fold_names}
+
+        for prediction in cached_pooled_predictions:
+            fold_name = str(prediction.get("fold_name", ""))
+            if fold_name in cached_predictions_by_fold:
+                cached_predictions_by_fold[fold_name].append(prediction)
+
+        for fold_name in fold_names:
+            cached_predictions = cached_predictions_by_fold[fold_name]
+            if not cached_predictions:
+                continue
+
+            cached_metrics = compute_binary_metrics(cached_predictions)
+            fold_result = Module4FoldResult(
+                mode=mode,
+                rep=rep,
+                seed=rep * 42,
+                fold_name=fold_name,
+                device="cached",
+                train_participant_count=-1,
+                test_participant_count=len(cached_predictions),
+                train_batch_count=-1,
+                test_batch_count=-1,
+                metrics=cached_metrics,
+                training_losses=[],
+                predictions=cached_predictions,
+                elapsed_seconds=0.0,
+                filtered_fold_sizes={},
+            )
+
+            fold_results.append(fold_result)
+            pooled_predictions.extend(cached_predictions)
+            completed_folds.add(fold_name)
+            LOGGER.info(
+                "Skipping completed fold mode=%s rep=%d fold=%s using aggregated cached outputs.",
+                mode,
+                rep,
+                fold_name,
+            )
+
+            cached_checkpoint = _checkpoint_file_path(results_dir, mode, rep, fold_name)
+            if cached_checkpoint.exists():
+                cached_checkpoint.unlink()
 
     for fold_name in fold_names:
+        if fold_name in completed_folds:
+            continue
+
         fold_predictions_path = _fold_predictions_path(results_dir, mode, rep, fold_name)
         fold_report_path = _fold_report_path(results_dir, mode, rep, fold_name)
 
-        if resume and fold_predictions_path.exists() and fold_report_path.exists():
+        if output_mode == "detailed" and resume and fold_predictions_path.exists() and fold_report_path.exists():
             cached_predictions = load_predictions_csv(fold_predictions_path)
             cached_metrics = compute_binary_metrics(cached_predictions)
 
@@ -871,21 +1126,22 @@ def run_all_folds(
                 resume=resume,
             )
 
-            fold_predictions_for_save: list[dict[str, object]] = []
-            for prediction in fold_result.predictions:
-                prediction_copy = dict(prediction)
-                prediction_copy["fold_name"] = fold_name
-                fold_predictions_for_save.append(prediction_copy)
+            if output_mode == "detailed":
+                fold_predictions_for_save: list[dict[str, object]] = []
+                for prediction in fold_result.predictions:
+                    prediction_copy = dict(prediction)
+                    prediction_copy["fold_name"] = fold_name
+                    fold_predictions_for_save.append(prediction_copy)
 
-            save_predictions_csv(
-                output_path=fold_predictions_path,
-                mode=mode,
-                rep=rep,
-                predictions=fold_predictions_for_save,
-            )
+                save_predictions_csv(
+                    output_path=fold_predictions_path,
+                    mode=mode,
+                    rep=rep,
+                    predictions=fold_predictions_for_save,
+                )
 
-            fold_report_text = format_fold_report(sanity_result=sanity_result, fold_result=fold_result)
-            save_report(fold_report_text, fold_report_path)
+                fold_report_text = format_fold_report(sanity_result=sanity_result, fold_result=fold_result)
+                save_report(fold_report_text, fold_report_path)
 
             append_history_row(
                 history_path=fold_history_path,
@@ -924,6 +1180,32 @@ def run_all_folds(
             prediction_with_fold["fold_name"] = fold_name
             pooled_predictions.append(prediction_with_fold)
 
+        if output_mode == "overwrite":
+            interim_metrics = compute_binary_metrics(pooled_predictions)
+            interim_result = Module4ConditionResult(
+                mode=mode,
+                rep=rep,
+                fold_results=fold_results,
+                pooled_metrics=interim_metrics,
+                pooled_prediction_count=len(pooled_predictions),
+                duplicate_prediction_ids=set(),
+            )
+
+            save_predictions_csv(
+                output_path=all_folds_predictions_path,
+                mode=mode,
+                rep=rep,
+                predictions=pooled_predictions,
+            )
+            save_report(
+                report_text=format_all_folds_report(sanity_result=sanity_result, condition_result=interim_result),
+                output_path=all_folds_report_path,
+            )
+
+            fold_checkpoint = _checkpoint_file_path(results_dir, mode, rep, fold_name)
+            if fold_checkpoint.exists():
+                fold_checkpoint.unlink()
+
     seen_participants: set[str] = set()
     duplicate_ids: set[str] = set()
     for prediction in pooled_predictions:
@@ -949,7 +1231,7 @@ def run_all_folds(
         },
     )
 
-    return Module4ConditionResult(
+    condition_result = Module4ConditionResult(
         mode=mode,
         rep=rep,
         fold_results=fold_results,
@@ -957,6 +1239,20 @@ def run_all_folds(
         pooled_prediction_count=len(pooled_predictions),
         duplicate_prediction_ids=duplicate_ids,
     )
+
+    if output_mode == "overwrite":
+        save_predictions_csv(
+            output_path=all_folds_predictions_path,
+            mode=mode,
+            rep=rep,
+            predictions=pooled_predictions,
+        )
+        save_report(
+            report_text=format_all_folds_report(sanity_result=sanity_result, condition_result=condition_result),
+            output_path=all_folds_report_path,
+        )
+
+    return condition_result
 
 
 def run_sanity_checks() -> Module4SanityResult:
@@ -1296,6 +1592,36 @@ def parse_arguments() -> argparse.Namespace:
         action="store_true",
         help="Disable checkpoint-based resume and completed-fold reuse.",
     )
+    parser.add_argument(
+        "--output-mode",
+        type=str,
+        default="detailed",
+        choices=["detailed", "overwrite"],
+        help="detailed=save per-fold files; overwrite=keep one all-folds file updated per mode.",
+    )
+    parser.add_argument(
+        "--debug-ctga-batch",
+        action="store_true",
+        help="Run one-batch CT-GA diagnostic and print r/s/cosine/softmax statistics.",
+    )
+    parser.add_argument(
+        "--debug-ctga-only",
+        action="store_true",
+        help="Exit immediately after CT-GA diagnostic without training.",
+    )
+    parser.add_argument(
+        "--debug-fold",
+        type=str,
+        default="fold1",
+        help="Fold used when running CT-GA one-batch diagnostic.",
+    )
+    parser.add_argument(
+        "--debug-batch-source",
+        type=str,
+        default="train",
+        choices=["train", "test"],
+        help="Data split for CT-GA one-batch diagnostic.",
+    )
     return parser.parse_args()
 
 
@@ -1321,6 +1647,21 @@ def main() -> int:
         gradient_flow_ok=True,
     )
 
+    if cli_args.debug_ctga_batch:
+        diagnostic_text = run_ctga_batch_diagnostic(
+            project_root=project_root,
+            results_dir=results_dir,
+            mode=cli_args.mode,
+            fold_name=cli_args.debug_fold,
+            rep=cli_args.rep,
+            batch_size=cli_args.batch_size,
+            num_workers=cli_args.num_workers,
+            batch_source=cli_args.debug_batch_source,
+        )
+        print(diagnostic_text)
+        if cli_args.debug_ctga_only:
+            return 0
+
     if cli_args.all_folds:
         condition_result = run_all_folds(
             project_root=project_root,
@@ -1334,6 +1675,7 @@ def main() -> int:
             checkpoint_every_epochs=cli_args.checkpoint_every_epochs,
             preview_participants=cli_args.preview_participants,
             resume=resume_enabled,
+            output_mode=cli_args.output_mode,
             sanity_result=sanity_result,
         )
 
