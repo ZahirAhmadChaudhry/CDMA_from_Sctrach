@@ -4,10 +4,13 @@ import argparse
 import csv
 import logging
 import math
+import shutil
 import statistics
 import time
+import zipfile
 from pathlib import Path
 
+from cdma.config import GOOGLE_DRIVE_FEATURE_ARCHIVE_ID
 from cdma.module4_cdma import BATCH_SIZE, CHECKPOINT_EVERY_EPOCHS, EPOCHS, LOG_EVERY_EPOCHS, PREVIEW_PARTICIPANTS
 from cdma.module4_cdma import run_sanity_checks
 from cdma.module5_experiment_runner import (
@@ -78,6 +81,111 @@ def _comparison_report_path(results_dir: Path) -> Path:
 
 def _test_mode_report_path(results_dir: Path) -> Path:
     return results_dir / "module6_test_mode_report.txt"
+
+
+def _find_first(root: Path, name: str) -> Path:
+    matches = [path for path in root.rglob(name)]
+    if not matches:
+        raise FileNotFoundError(f"Could not find {name} under {root}")
+    return matches[0]
+
+
+def _find_dir(root: Path, dir_name: str) -> Path:
+    matches = [path for path in root.rglob(dir_name) if path.is_dir()]
+    if not matches:
+        raise FileNotFoundError(f"Could not find directory {dir_name} under {root}")
+    return matches[0]
+
+
+def _count_feature_files(feature_dir: Path) -> int:
+    if not feature_dir.exists():
+        return 0
+    return len(list(feature_dir.glob("*_frames.npy")))
+
+
+def _bootstrap_data_from_gdrive(
+    project_root: Path,
+    results_dir: Path,
+    gdrive_file_id: str,
+    force_download: bool,
+) -> None:
+    try:
+        import gdown
+    except ImportError as import_error:
+        raise RuntimeError(
+            "gdown is required for --download-data. Install dependencies from requirements.txt first."
+        ) from import_error
+
+    archive_path = results_dir / "androids_features.zip"
+    extract_dir = results_dir / "androids_extracted"
+    data_dir = project_root / "data"
+    fold_csv_path = data_dir / "fold-lists.csv"
+    cdma_features_dir = data_dir / "cdma_features"
+
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    if force_download and archive_path.exists():
+        archive_path.unlink()
+
+    if archive_path.exists() and not force_download:
+        LOGGER.info("Using cached feature archive: %s", archive_path)
+    else:
+        LOGGER.info("Downloading feature archive from Google Drive (id=%s)", gdrive_file_id)
+        gdown.download(id=gdrive_file_id, output=str(archive_path), quiet=False)
+
+    if force_download and extract_dir.exists():
+        shutil.rmtree(extract_dir)
+    extract_dir.mkdir(parents=True, exist_ok=True)
+
+    LOGGER.info("Extracting feature archive to %s", extract_dir)
+    with zipfile.ZipFile(archive_path, mode="r") as zip_file:
+        zip_file.extractall(path=extract_dir)
+
+    source_fold_csv = _find_first(extract_dir, "fold-lists.csv")
+    source_cdma_features_dir = _find_dir(extract_dir, "cdma_features")
+
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    if fold_csv_path.exists():
+        fold_csv_path.unlink()
+    if cdma_features_dir.exists():
+        shutil.rmtree(cdma_features_dir)
+
+    shutil.copy2(source_fold_csv, fold_csv_path)
+    shutil.copytree(source_cdma_features_dir, cdma_features_dir)
+
+    LOGGER.info("Data prepared under %s", data_dir)
+
+
+def _confirm_data_ready(project_root: Path) -> None:
+    fold_csv_path = project_root / "data" / "fold-lists.csv"
+    rt_feature_dir = project_root / "data" / "cdma_features" / "rt"
+    it_feature_dir = project_root / "data" / "cdma_features" / "it"
+
+    if not fold_csv_path.exists():
+        raise FileNotFoundError(f"Missing fold list file: {fold_csv_path}")
+    if not rt_feature_dir.exists():
+        raise FileNotFoundError(f"Missing RT feature directory: {rt_feature_dir}")
+    if not it_feature_dir.exists():
+        raise FileNotFoundError(f"Missing IT feature directory: {it_feature_dir}")
+
+    rt_file_count = _count_feature_files(rt_feature_dir)
+    it_file_count = _count_feature_files(it_feature_dir)
+
+    if rt_file_count <= 0 or it_file_count <= 0:
+        raise RuntimeError(
+            (
+                "Feature directories exist but no frame files were found. "
+                f"rt_files={rt_file_count}, it_files={it_file_count}"
+            )
+        )
+
+    LOGGER.info(
+        "Data readiness confirmed: fold_csv=%s rt_files=%d it_files=%d",
+        fold_csv_path,
+        rt_file_count,
+        it_file_count,
+    )
 
 
 def _load_pooled_rows(pooled_results_path: Path) -> list[dict[str, object]]:
@@ -322,6 +430,22 @@ def parse_arguments() -> argparse.Namespace:
         action="store_true",
         help="Disable resume and force all requested runs.",
     )
+    parser.add_argument(
+        "--download-data",
+        action="store_true",
+        help="Download and prepare data from Google Drive before running experiments.",
+    )
+    parser.add_argument(
+        "--force-data-download",
+        action="store_true",
+        help="Force re-download and re-extract of the dataset archive.",
+    )
+    parser.add_argument(
+        "--gdrive-file-id",
+        type=str,
+        default=GOOGLE_DRIVE_FEATURE_ARCHIVE_ID,
+        help="Google Drive file id for the Androids feature archive.",
+    )
     return parser.parse_args()
 
 
@@ -335,6 +459,24 @@ def main() -> int:
     if cli_args.test:
         LOGGER.info("Running Module 6 test mode using dummy-data sanity checks across all 13 modes.")
         return _run_test_mode(results_dir=results_dir)
+
+    if cli_args.download_data:
+        _bootstrap_data_from_gdrive(
+            project_root=project_root,
+            results_dir=results_dir,
+            gdrive_file_id=cli_args.gdrive_file_id,
+            force_download=cli_args.force_data_download,
+        )
+
+    try:
+        _confirm_data_ready(project_root)
+    except Exception as data_error:
+        raise RuntimeError(
+            (
+                "Dataset setup check failed. Ensure data/fold-lists.csv and data/cdma_features/{rt,it} exist, "
+                "or re-run with --download-data."
+            )
+        ) from data_error
 
     requested_conditions = parse_conditions(cli_args.conditions)
     requested_reps = parse_reps(rep_count=cli_args.reps, rep_start=cli_args.rep_start)
