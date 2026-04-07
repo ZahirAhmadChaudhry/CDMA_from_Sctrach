@@ -29,6 +29,8 @@ THRESHOLD = 0.5
 LOG_EVERY_EPOCHS = 50
 CHECKPOINT_EVERY_EPOCHS = 50
 PREVIEW_PARTICIPANTS = 5
+FRAME_COUNT_DIAGNOSTIC_LOGGED = False
+BA1_PROBABILITY_DIAGNOSTIC_LOGGED: set[str] = set()
 
 
 @dataclass(frozen=True)
@@ -496,10 +498,7 @@ class LSTM1Layer(nn.Module):
     def forward(self, frame_batch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         hidden_states, _ = self.lstm(frame_batch)
         context_vectors = hidden_states.mean(dim=1)
-        probabilities = torch.sigmoid(self.classifier(context_vectors)).clamp(
-            min=PROB_CLAMP_MIN,
-            max=PROB_CLAMP_MAX,
-        )
+        probabilities = torch.sigmoid(self.classifier(context_vectors))
         return context_vectors, probabilities
 
 
@@ -630,15 +629,20 @@ class CombinedBCELoss(nn.Module):
         super().__init__()
         self.base_loss = nn.BCELoss(reduction="mean")
 
-    def forward(self, active_probabilities: list[torch.Tensor], labels: torch.Tensor) -> torch.Tensor:
+    def forward(self, output_probabilities: dict[str, torch.Tensor], labels: torch.Tensor) -> torch.Tensor:
         if labels.ndim == 1:
             labels = labels.unsqueeze(1)
 
-        smoothed_labels = labels.float() * (1.0 - 2.0 * LABEL_SMOOTH_EPS) + LABEL_SMOOTH_EPS
+        hard_labels = labels.float()
+        smoothed_labels = hard_labels * (1.0 - 2.0 * LABEL_SMOOTH_EPS) + LABEL_SMOOTH_EPS
 
         loss_sum = torch.zeros((), dtype=smoothed_labels.dtype, device=smoothed_labels.device)
-        for probability in active_probabilities:
-            loss_sum = loss_sum + self.base_loss(probability, smoothed_labels)
+        for output_name, probability in output_probabilities.items():
+            if output_name in {"p_c", "p_o"}:
+                target = hard_labels
+            else:
+                target = smoothed_labels
+            loss_sum = loss_sum + self.base_loss(probability, target)
         return loss_sum
 
 
@@ -805,7 +809,7 @@ def train_one_epoch(
     for batch in data_loaders.train_loader:
         rt_frames, it_frames, rt_mask, it_mask, labels = _prepare_batch_inputs(batch, mode, device)
         outputs = model(rt_frames, it_frames, rt_mask, it_mask, mode)
-        loss = loss_fn(outputs["active_probabilities"], labels)
+        loss = loss_fn(outputs["probabilities"], labels)
 
         optimizer.zero_grad()
         loss.backward()
@@ -857,6 +861,44 @@ def evaluate_model(
     return predictions
 
 
+def log_frame_count_diagnostic(data_loaders: Module2DataLoaders) -> None:
+    for sample in data_loaders.test_dataset.samples:
+        rt_frame_count = int(sample.n_rt)
+        it_frame_count = int(sample.n_it)
+        ratio = it_frame_count / max(1, rt_frame_count)
+        LOGGER.info(
+            "DIAG frames: pid=%s RT=%d IT=%d ratio=%.2f",
+            sample.participant_id,
+            rt_frame_count,
+            it_frame_count,
+            ratio,
+        )
+
+
+def log_ba1_probability_diagnostic(predictions: list[dict[str, object]], mode: str) -> None:
+    if mode == "ba1_rt":
+        probability_key = "p_c"
+    elif mode == "ba1_it":
+        probability_key = "p_o"
+    else:
+        return
+
+    for prediction in predictions:
+        probability_map = prediction.get("output_probabilities", {})
+        probability_value = probability_map.get(probability_key)
+        if probability_value is None:
+            continue
+
+        LOGGER.info(
+            "DIAG probs: mode=%s pid=%s label=%d %s=%.4f",
+            mode,
+            prediction["participant_id"],
+            int(prediction["true_label"]),
+            probability_key,
+            float(probability_value),
+        )
+
+
 def compute_binary_metrics(predictions: list[dict[str, object]]) -> dict[str, float]:
     true_labels = [int(prediction["true_label"]) for prediction in predictions]
     predicted_labels = [int(prediction["predicted_label"]) for prediction in predictions]
@@ -891,6 +933,9 @@ def run_single_fold(
     preview_participants: int,
     resume: bool,
 ) -> Module4FoldResult:
+    global FRAME_COUNT_DIAGNOSTIC_LOGGED
+    global BA1_PROBABILITY_DIAGNOSTIC_LOGGED
+
     if mode not in MODE_CONFIGS:
         raise ValueError(f"Unsupported mode: {mode}")
 
@@ -904,6 +949,10 @@ def run_single_fold(
         num_workers=num_workers,
         shuffle_train=True,
     )
+
+    if not FRAME_COUNT_DIAGNOSTIC_LOGGED:
+        log_frame_count_diagnostic(data_loaders)
+        FRAME_COUNT_DIAGNOSTIC_LOGGED = True
 
     device = resolve_device()
     model = CDMAModel().to(device)
@@ -983,6 +1032,11 @@ def run_single_fold(
         device=device,
         threshold=THRESHOLD,
     )
+
+    if mode in {"ba1_rt", "ba1_it"} and mode not in BA1_PROBABILITY_DIAGNOSTIC_LOGGED:
+        log_ba1_probability_diagnostic(predictions=predictions, mode=mode)
+        BA1_PROBABILITY_DIAGNOSTIC_LOGGED.add(mode)
+
     log_prediction_preview(
         predictions=predictions,
         top_k=preview_participants,
@@ -1314,8 +1368,8 @@ def run_sanity_checks() -> Module4SanityResult:
     ba1_outputs = model(rt_frames, None, rt_mask, None, "ba1_rt")
     full_outputs = model(rt_frames, it_frames, rt_mask, it_mask, "full_cdma")
 
-    loss_b1 = float(loss_fn(ba1_outputs["active_probabilities"], labels).item())
-    loss_b6 = float(loss_fn(full_outputs["active_probabilities"], labels).item())
+    loss_b1 = float(loss_fn(ba1_outputs["probabilities"], labels).item())
+    loss_b6 = float(loss_fn(full_outputs["probabilities"], labels).item())
     loss_scaling_ok = loss_b6 > loss_b1
 
     train_model = CDMAModel().to(device)
@@ -1323,7 +1377,7 @@ def run_sanity_checks() -> Module4SanityResult:
     before_parameters = [parameter.detach().clone() for parameter in train_model.parameters()]
 
     train_outputs = train_model(rt_frames, it_frames, rt_mask, it_mask, "full_cdma")
-    train_loss = loss_fn(train_outputs["active_probabilities"], labels)
+    train_loss = loss_fn(train_outputs["probabilities"], labels)
 
     optimizer.zero_grad()
     train_loss.backward()
