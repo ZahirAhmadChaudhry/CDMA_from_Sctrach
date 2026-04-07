@@ -167,6 +167,18 @@ def _checkpoint_file_path(results_dir: Path, mode: str, rep: int, fold_name: str
     return results_dir / "checkpoints" / mode / f"rep_{rep}" / f"{fold_name}_latest.pt"
 
 
+def _diagnostics_dir(results_dir: Path) -> Path:
+    return results_dir / "diagnostics"
+
+
+def _frame_count_diagnostic_path(results_dir: Path) -> Path:
+    return _diagnostics_dir(results_dir) / "frame_counts.csv"
+
+
+def _ba1_probability_diagnostic_path(results_dir: Path) -> Path:
+    return _diagnostics_dir(results_dir) / "ba1_probabilities.csv"
+
+
 def _checkpoint_path(results_dir: Path, mode: str, rep: int, fold_name: str) -> Path:
     checkpoint_file = _checkpoint_file_path(results_dir, mode, rep, fold_name)
     checkpoint_dir = checkpoint_file.parent
@@ -215,6 +227,21 @@ def append_history_row(history_path: Path, field_names: list[str], row_data: dic
         if not file_exists:
             writer.writeheader()
         writer.writerow(row_data)
+
+
+def append_csv_rows(history_path: Path, field_names: list[str], rows: list[dict[str, object]]) -> None:
+    if not rows:
+        return
+
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    file_exists = history_path.exists()
+
+    with history_path.open(mode="a", encoding="utf-8", newline="") as history_file:
+        writer = csv.DictWriter(history_file, fieldnames=field_names)
+        if not file_exists:
+            writer.writeheader()
+        for row_data in rows:
+            writer.writerow(row_data)
 
 
 def load_predictions_csv(predictions_path: Path) -> list[dict[str, object]]:
@@ -861,11 +888,33 @@ def evaluate_model(
     return predictions
 
 
-def log_frame_count_diagnostic(data_loaders: Module2DataLoaders) -> None:
+def log_frame_count_diagnostic(
+    data_loaders: Module2DataLoaders,
+    results_dir: Path,
+    mode: str,
+    rep: int,
+    fold_name: str,
+) -> None:
+    diagnostic_rows: list[dict[str, object]] = []
+    row_timestamp = int(time.time())
+
     for sample in data_loaders.test_dataset.samples:
         rt_frame_count = int(sample.n_rt)
         it_frame_count = int(sample.n_it)
         ratio = it_frame_count / max(1, rt_frame_count)
+        diagnostic_rows.append(
+            {
+                "timestamp": row_timestamp,
+                "mode": mode,
+                "rep": rep,
+                "fold": fold_name,
+                "participant_id": sample.participant_id,
+                "true_label": int(sample.label),
+                "n_rt": rt_frame_count,
+                "n_it": it_frame_count,
+                "it_to_rt_ratio": f"{ratio:.6f}",
+            }
+        )
         LOGGER.info(
             "DIAG frames: pid=%s RT=%d IT=%d ratio=%.2f",
             sample.participant_id,
@@ -874,8 +923,32 @@ def log_frame_count_diagnostic(data_loaders: Module2DataLoaders) -> None:
             ratio,
         )
 
+    append_csv_rows(
+        history_path=_frame_count_diagnostic_path(results_dir),
+        field_names=[
+            "timestamp",
+            "mode",
+            "rep",
+            "fold",
+            "participant_id",
+            "true_label",
+            "n_rt",
+            "n_it",
+            "it_to_rt_ratio",
+        ],
+        rows=diagnostic_rows,
+    )
 
-def log_ba1_probability_diagnostic(predictions: list[dict[str, object]], mode: str) -> None:
+    LOGGER.info("Saved frame-count diagnostics to %s", _frame_count_diagnostic_path(results_dir))
+
+
+def log_ba1_probability_diagnostic(
+    predictions: list[dict[str, object]],
+    results_dir: Path,
+    mode: str,
+    rep: int,
+    fold_name: str,
+) -> None:
     if mode == "ba1_rt":
         probability_key = "p_c"
     elif mode == "ba1_it":
@@ -883,11 +956,27 @@ def log_ba1_probability_diagnostic(predictions: list[dict[str, object]], mode: s
     else:
         return
 
+    diagnostic_rows: list[dict[str, object]] = []
+    row_timestamp = int(time.time())
+
     for prediction in predictions:
         probability_map = prediction.get("output_probabilities", {})
         probability_value = probability_map.get(probability_key)
         if probability_value is None:
             continue
+
+        diagnostic_rows.append(
+            {
+                "timestamp": row_timestamp,
+                "mode": mode,
+                "rep": rep,
+                "fold": fold_name,
+                "participant_id": prediction["participant_id"],
+                "true_label": int(prediction["true_label"]),
+                "probability_name": probability_key,
+                "probability": f"{float(probability_value):.6f}",
+            }
+        )
 
         LOGGER.info(
             "DIAG probs: mode=%s pid=%s label=%d %s=%.4f",
@@ -897,6 +986,23 @@ def log_ba1_probability_diagnostic(predictions: list[dict[str, object]], mode: s
             probability_key,
             float(probability_value),
         )
+
+    append_csv_rows(
+        history_path=_ba1_probability_diagnostic_path(results_dir),
+        field_names=[
+            "timestamp",
+            "mode",
+            "rep",
+            "fold",
+            "participant_id",
+            "true_label",
+            "probability_name",
+            "probability",
+        ],
+        rows=diagnostic_rows,
+    )
+
+    LOGGER.info("Saved BA1 probability diagnostics to %s", _ba1_probability_diagnostic_path(results_dir))
 
 
 def compute_binary_metrics(predictions: list[dict[str, object]]) -> dict[str, float]:
@@ -951,7 +1057,13 @@ def run_single_fold(
     )
 
     if not FRAME_COUNT_DIAGNOSTIC_LOGGED:
-        log_frame_count_diagnostic(data_loaders)
+        log_frame_count_diagnostic(
+            data_loaders=data_loaders,
+            results_dir=results_dir,
+            mode=mode,
+            rep=rep,
+            fold_name=test_fold_name,
+        )
         FRAME_COUNT_DIAGNOSTIC_LOGGED = True
 
     device = resolve_device()
@@ -1034,7 +1146,13 @@ def run_single_fold(
     )
 
     if mode in {"ba1_rt", "ba1_it"} and mode not in BA1_PROBABILITY_DIAGNOSTIC_LOGGED:
-        log_ba1_probability_diagnostic(predictions=predictions, mode=mode)
+        log_ba1_probability_diagnostic(
+            predictions=predictions,
+            results_dir=results_dir,
+            mode=mode,
+            rep=rep,
+            fold_name=test_fold_name,
+        )
         BA1_PROBABILITY_DIAGNOSTIC_LOGGED.add(mode)
 
     log_prediction_preview(
