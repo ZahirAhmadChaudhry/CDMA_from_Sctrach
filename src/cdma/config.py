@@ -2,6 +2,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 GOOGLE_DRIVE_FEATURE_ARCHIVE_ID = "1LJenZ-VXktBbroTI3btVSkRRq-glSWCb"
+LABEL_SMOOTH_EPS = 0.05
+PROB_CLAMP_MIN = 0.01
+PROB_CLAMP_MAX = 0.99
 
 
 @dataclass(frozen=True)

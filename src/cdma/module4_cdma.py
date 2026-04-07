@@ -14,6 +14,7 @@ import torch.nn.functional as torch_functional
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from torch import nn
 
+from cdma.config import LABEL_SMOOTH_EPS, PROB_CLAMP_MAX, PROB_CLAMP_MIN
 from cdma.module2_data import Module2DataLoaders, get_dataloaders
 
 LOGGER = logging.getLogger(__name__)
@@ -495,7 +496,10 @@ class LSTM1Layer(nn.Module):
     def forward(self, frame_batch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         hidden_states, _ = self.lstm(frame_batch)
         context_vectors = hidden_states.mean(dim=1)
-        probabilities = torch.sigmoid(self.classifier(context_vectors))
+        probabilities = torch.sigmoid(self.classifier(context_vectors)).clamp(
+            min=PROB_CLAMP_MIN,
+            max=PROB_CLAMP_MAX,
+        )
         return context_vectors, probabilities
 
 
@@ -528,7 +532,10 @@ class LSTM2Layer(nn.Module):
         )
 
         pooled_sequence = masked_mean(unpacked_outputs, sequence_mask)
-        probabilities = torch.sigmoid(self.classifier(pooled_sequence))
+        probabilities = torch.sigmoid(self.classifier(pooled_sequence)).clamp(
+            min=PROB_CLAMP_MIN,
+            max=PROB_CLAMP_MAX,
+        )
         return pooled_sequence, probabilities
 
 
@@ -607,8 +614,14 @@ class CTFLayer(nn.Module):
     ) -> dict[str, torch.Tensor]:
         fusion_pre_attention = rt_mean + it_mean
         fusion_post_attention = rt_star_mean + it_star_mean
-        p_f1 = torch.sigmoid(self.classifier_f1(fusion_pre_attention))
-        p_f2 = torch.sigmoid(self.classifier_f2(fusion_post_attention))
+        p_f1 = torch.sigmoid(self.classifier_f1(fusion_pre_attention)).clamp(
+            min=PROB_CLAMP_MIN,
+            max=PROB_CLAMP_MAX,
+        )
+        p_f2 = torch.sigmoid(self.classifier_f2(fusion_post_attention)).clamp(
+            min=PROB_CLAMP_MIN,
+            max=PROB_CLAMP_MAX,
+        )
         return {"p_f1": p_f1, "p_f2": p_f2}
 
 
@@ -621,9 +634,11 @@ class CombinedBCELoss(nn.Module):
         if labels.ndim == 1:
             labels = labels.unsqueeze(1)
 
-        loss_sum = torch.zeros((), dtype=labels.dtype, device=labels.device)
+        smoothed_labels = labels.float() * (1.0 - 2.0 * LABEL_SMOOTH_EPS) + LABEL_SMOOTH_EPS
+
+        loss_sum = torch.zeros((), dtype=smoothed_labels.dtype, device=smoothed_labels.device)
         for probability in active_probabilities:
-            loss_sum = loss_sum + self.base_loss(probability, labels)
+            loss_sum = loss_sum + self.base_loss(probability, smoothed_labels)
         return loss_sum
 
 
