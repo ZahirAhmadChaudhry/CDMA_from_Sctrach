@@ -7,8 +7,9 @@ cd "$ROOT_DIR"
 RESULTS_ROOT="${1:-results/module7_full_run}"
 MODULE6_DIR="$RESULTS_ROOT/module6"
 MODULE7_DIR="$RESULTS_ROOT/module7"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 
-python run_module6.py \
+"$PYTHON_BIN" run_module6.py \
   --download-data \
   --conditions all13 \
   --reps 10 \
@@ -18,7 +19,7 @@ python run_module6.py \
   --output-mode overwrite \
   --results-dir "$MODULE6_DIR"
 
-python run_module7.py \
+"$PYTHON_BIN" run_module7.py \
   --results-dir "$MODULE6_DIR" \
   --output-dir "$MODULE7_DIR"
 
